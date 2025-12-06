@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pill Prediction Vetter</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      background: #1e1e1e;
+      color: #e0e0e0;
+    }
+    header {
+      background: #2d2d2d;
+      padding: 15px 20px;
+      border-bottom: 2px solid #444;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    h1 { font-size: 20px; }
+    #progress { font-size: 16px; color: #aaa; }
+    main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+    aside {
+      width: 250px;
+      background: #252525;
+      padding: 20px;
+      overflow-y: auto;
+      border-right: 2px solid #444;
+    }
+    section {
+      margin-bottom: 25px;
+    }
+    h2 {
+      font-size: 14px;
+      color: #888;
+      margin-bottom: 10px;
+      text-transform: uppercase;
+    }
+    input[type="file"] {
+      width: 100%;
+      padding: 8px;
+      margin-bottom: 8px;
+      background: #333;
+      color: #e0e0e0;
+      border: 1px solid #555;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    button {
+      width: 100%;
+      padding: 10px;
+      margin-bottom: 8px;
+      background: #4a4a4a;
+      color: #e0e0e0;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button:hover { background: #5a5a5a; }
+    button.primary { background: #0d7377; }
+    button.primary:hover { background: #0e8388; }
+    button.danger { background: #c73e1d; }
+    button.danger:hover { background: #d64a26; }
+    .stats div { margin-bottom: 5px; font-size: 13px; }
+    .nav-buttons {
+      display: flex;
+      gap: 5px;
+    }
+    .nav-buttons button {
+      flex: 1;
+      margin-bottom: 8px;
+    }
+    #content {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px;
+      overflow-y: auto;
+    }
+    #canvasContainer {
+      background: #2d2d2d;
+      padding: 10px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      max-width: 100%;
+      max-height: 70vh;
+      overflow: auto;
+    }
+    canvas {
+      display: block;
+      max-width: 100%;
+      height: auto;
+    }
+    #metadata {
+      background: #252525;
+      padding: 15px;
+      border-radius: 8px;
+      width: 100%;
+      max-width: 800px;
+    }
+    #metadata div {
+      margin-bottom: 8px;
+      font-size: 14px;
+    }
+    #metadata strong { color: #aaa; }
+    #detections {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 5px;
+    }
+    .detection-badge {
+      background: #333;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+    .loading {
+      text-align: center;
+      padding: 50px;
+      color: #888;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Pill Prediction Vetter</h1>
+    <div id="progress">No data loaded</div>
+  </header>
+
+  <main>
+    <aside>
+      <section>
+        <h2>Load Files</h2>
+        <input type="file" id="jsonInput" accept=".json" title="Load JSON predictions">
+        <input type="file" id="csvInput" accept=".csv" title="Load CSV metadata">
+        <input type="file" id="imagesInput" webkitdirectory multiple title="Load image directory">
+      </section>
+
+      <section>
+        <h2>Statistics</h2>
+        <div class="stats">
+          <div>Total: <span id="totalCount">0</span></div>
+          <div>Flagged: <span id="flaggedCount">0</span></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Navigation</h2>
+        <div class="nav-buttons">
+          <button onclick="prev()">← Prev</button>
+          <button onclick="next()">Next →</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Actions</h2>
+        <button class="primary" onclick="approveCurrent()">✓ Accept (Y)</button>
+        <button class="danger" onclick="flagCurrent()">✗ Flag (N)</button>
+        <button onclick="exportJSON()">Export JSON</button>
+      </section>
+    </aside>
+
+    <div id="content">
+      <div class="loading">Load JSON, CSV, and images to begin</div>
+    </div>
+  </main>
+
+  <script>
+    // Global state
+    let predictions = [];
+    let csvData = new Map();
+    let images = new Map();
+    let currentIndex = 0;
+    let flagged = new Set();
+
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+
+    // Load from localStorage
+    const savedFlagged = localStorage.getItem('flagged');
+    const savedIndex = localStorage.getItem('index');
+    if (savedFlagged) flagged = new Set(JSON.parse(savedFlagged));
+    if (savedIndex) currentIndex = parseInt(savedIndex);
+
+    // File input handlers
+    document.getElementById('jsonInput').addEventListener('change', e => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = ev => {
+        predictions = JSON.parse(ev.target.result);
+        updateStats();
+        if (images.size > 0) display();
+      };
+      reader.readAsText(file);
+    });
+
+    document.getElementById('csvInput').addEventListener('change', e => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = ev => {
+        csvData = parseCSV(ev.target.result);
+        if (predictions.length > 0 && images.size > 0) display();
+      };
+      reader.readAsText(file);
+    });
+
+    document.getElementById('imagesInput').addEventListener('change', e => {
+      const files = Array.from(e.target.files);
+      images.clear();
+      files.forEach(file => images.set(file.name, file));
+      if (predictions.length > 0) display();
+    });
+
+    // CSV parser
+    function parseCSV(text) {
+      const lines = text.split('\n').filter(line => line.trim());
+      const map = new Map();
+      for (let i = 1; i < lines.length; i++) {
+        const cols = lines[i].split(',');
+        if (cols.length >= 10) {
+          map.set(cols[9], {
+            drug: cols[5] || 'Unknown',
+            imprint: cols[8] || 'Unknown'
+          });
+        }
+      }
+      return map;
+    }
+
+    // Display current image
+    function display() {
+      if (predictions.length === 0 || images.size === 0) return;
+
+      const pred = predictions[currentIndex];
+      const imageFile = images.get(pred.image);
+
+      const content = document.getElementById('content');
+      content.innerHTML = '';
+
+      if (!imageFile) {
+        content.innerHTML = '<div class="loading">Image not found: ' + pred.image + '</div>';
+        updateProgress();
+        return;
+      }
+
+      // Draw image with bounding boxes
+      const reader = new FileReader();
+      reader.onload = e => {
+        const img = new Image();
+        img.onload = () => {
+          canvas.width = img.width;
+          canvas.height = img.height;
+          ctx.drawImage(img, 0, 0);
+
+          // Draw bounding boxes
+          pred.labels.forEach(label => {
+            const [cx, cy, w, h] = label.coords.split(' ').map(Number);
+            const x = (cx - w/2) * canvas.width;
+            const y = (cy - h/2) * canvas.height;
+            const width = w * canvas.width;
+            const height = h * canvas.height;
+
+            const color = label.confidence > 0.8 ? '#0f0' :
+                          label.confidence > 0.5 ? '#ff0' : '#f00';
+
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x, y, width, height);
+            ctx.fillStyle = color;
+            ctx.font = '14px Arial';
+            ctx.fillText(`${label.label} ${(label.confidence*100).toFixed(0)}%`,
+                         x + 2, y - 5);
+          });
+
+          // Add canvas to DOM
+          const canvasContainer = document.createElement('div');
+          canvasContainer.id = 'canvasContainer';
+          canvasContainer.appendChild(canvas);
+          content.appendChild(canvasContainer);
+
+          // Add metadata
+          const metadata = csvData.get(pred.image) || {drug: 'Unknown Drug', imprint: 'Unknown'};
+          const metadataDiv = document.createElement('div');
+          metadataDiv.id = 'metadata';
+          metadataDiv.innerHTML = `
+            <div><strong>Drug:</strong> ${metadata.drug}</div>
+            <div><strong>Imprint:</strong> ${metadata.imprint}</div>
+            <div><strong>Detections:</strong>
+              <div id="detections">
+                ${pred.labels.map(l =>
+                  `<span class="detection-badge">${l.label} (${(l.confidence*100).toFixed(0)}%)</span>`
+                ).join('')}
+              </div>
+            </div>
+            <div><strong>File:</strong> ${pred.image}</div>
+            <div><strong>Status:</strong> ${flagged.has(pred.image) ? '🚩 Flagged' : '✓ OK'}</div>
+          `;
+          content.appendChild(metadataDiv);
+        };
+        img.src = e.target.result;
+      };
+      reader.readAsDataURL(imageFile);
+
+      updateProgress();
+    }
+
+    // Navigation
+    function next() {
+      if (currentIndex < predictions.length - 1) {
+        currentIndex++;
+        localStorage.setItem('index', currentIndex);
+        display();
+      }
+    }
+
+    function prev() {
+      if (currentIndex > 0) {
+        currentIndex--;
+        localStorage.setItem('index', currentIndex);
+        display();
+      }
+    }
+
+    // Actions
+    function flagCurrent() {
+      if (predictions.length === 0) return;
+      flagged.add(predictions[currentIndex].image);
+      localStorage.setItem('flagged', JSON.stringify([...flagged]));
+      updateStats();
+      next();
+    }
+
+    function approveCurrent() {
+      if (predictions.length === 0) return;
+      flagged.delete(predictions[currentIndex].image);
+      localStorage.setItem('flagged', JSON.stringify([...flagged]));
+      updateStats();
+      next();
+    }
+
+    // Export
+    function exportJSON() {
+      if (predictions.length === 0) {
+        alert('No data to export');
+        return;
+      }
+      const cleaned = predictions.filter(p => !flagged.has(p.image));
+      const blob = new Blob([JSON.stringify(cleaned, null, 2)],
+                            {type: 'application/json'});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `cleaned_${Date.now()}.json`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      alert(`Exported ${cleaned.length} images (${flagged.size} removed)`);
+    }
+
+    // UI updates
+    function updateProgress() {
+      document.getElementById('progress').textContent =
+        predictions.length > 0 ? `${currentIndex + 1} / ${predictions.length}` : 'No data loaded';
+    }
+
+    function updateStats() {
+      document.getElementById('totalCount').textContent = predictions.length;
+      document.getElementById('flaggedCount').textContent = flagged.size;
+      updateProgress();
+    }
+
+    // Keyboard shortcuts
+    document.addEventListener('keydown', e => {
+      if (e.key === 'y' || e.key === 'Y') approveCurrent();
+      if (e.key === 'n' || e.key === 'N') flagCurrent();
+      if (e.key === 'ArrowLeft') prev();
+      if (e.key === 'ArrowRight') next();
+    });
+
+    // Initialize
+    updateStats();
+  </script>
+</body>
+</html>

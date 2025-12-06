@@ -1,0 +1,10 @@
+pandas
+numpy
+torch
+torchvision
+pillow
+scikit-learn
+tqdm
+matplotlib
+pytesseract
+ultralytics

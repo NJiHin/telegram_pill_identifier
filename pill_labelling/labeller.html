@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pill Imprint Labeller</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5; }
+        .container { max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }
+        h1 { margin-bottom: 20px; }
+        .controls { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; align-items: center; }
+        button { padding: 8px 16px; cursor: pointer; border: 1px solid #ccc; background: #fff; border-radius: 4px; }
+        button:hover { background: #f0f0f0; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        input[type="file"] { padding: 8px; }
+        .canvas-container { position: relative; display: inline-block; margin-bottom: 20px; }
+        canvas { border: 2px solid #333; display: block; cursor: crosshair; }
+        .info { margin-bottom: 10px; padding: 10px; background: #f9f9f9; border-radius: 4px; }
+        .boxes-list { margin-top: 20px; }
+        .box-item { padding: 8px; margin: 5px 0; background: #f0f0f0; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; }
+        .box-item.selected { background: #d0e8ff; }
+        .label-input { padding: 4px 8px; width: 120px; font-family: monospace; }
+        .delete-btn { padding: 4px 12px; background: #ff4444; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .delete-btn:hover { background: #cc0000; }
+        .status { padding: 10px; margin-top: 10px; background: #e8f5e9; border-radius: 4px; }
+        label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+        input[type="checkbox"] { cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Pill Imprint Labeller</h1>
+
+        <div class="controls">
+            <label>CSV: <input type="file" id="csvFile" accept=".csv" /></label>
+            <label>JSON (optional): <input type="file" id="jsonFile" accept=".json" /></label>
+            <button id="prevBtn">Previous</button>
+            <button id="nextBtn">Next</button>
+            <button id="flagBtn" style="background: #ff9800; color: white;">Flag as Wrong (F)</button>
+            <button id="exportBtn">Export Labels</button>
+            <button id="reviewModeBtn">Review Labeled Images</button>
+            <span id="imageCounter">0 / 0</span>
+        </div>
+
+        <div class="info">
+            <div><strong>Image:</strong> <span id="imageName">-</span></div>
+            <div><strong>Medicine:</strong> <span id="medicineName">-</span></div>
+            <div><strong>Imprint:</strong> <span id="imprintText">-</span></div>
+            <div><strong>Progress:</strong> <span id="progressText">Load CSV and JSON to start</span></div>
+            <div><strong>Instructions:</strong> Load CSV → (Optional) Load JSON → Draw box → Type label → ESC to delete last box → In Review Mode: Press F to flag wrong labels</div>
+        </div>
+
+        <div class="canvas-container">
+            <canvas id="canvas"></canvas>
+        </div>
+
+        <div class="boxes-list">
+            <h3>Imprint Labels:</h3>
+            <div id="boxesList"></div>
+        </div>
+
+        <div id="status" class="status" style="display: none;"></div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const csvFileInput = document.getElementById('csvFile');
+        const jsonFileInput = document.getElementById('jsonFile');
+        const prevBtn = document.getElementById('prevBtn');
+        const nextBtn = document.getElementById('nextBtn');
+        const exportBtn = document.getElementById('exportBtn');
+        const reviewModeBtn = document.getElementById('reviewModeBtn');
+        const flagBtn = document.getElementById('flagBtn');
+        const imageCounter = document.getElementById('imageCounter');
+        const imageName = document.getElementById('imageName');
+        const medicineName = document.getElementById('medicineName');
+        const imprintText = document.getElementById('imprintText');
+        const progressText = document.getElementById('progressText');
+        const boxesList = document.getElementById('boxesList');
+        const status = document.getElementById('status');
+
+        let allData = [];
+        let currentIndex = 0;
+        let currentImage = null;
+        let boxes = {};
+        let selectedBoxIdx = null;
+        let existingLabels = []; // Labels loaded from JSON file
+        let sessionBoxes = new Set(); // Track boxes created in this session
+        let reviewMode = false; // Review mode to view labeled images
+        let csvData = []; // Store all CSV data for review mode
+        let flaggedImages = new Set(); // Track images flagged as wrong
+
+        // Interaction states
+        let isDrawing = false;
+        let startX, startY;
+        let tempBox = null;
+
+        // Load existing JSON labels
+        jsonFileInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            try {
+                const text = await file.text();
+                existingLabels = JSON.parse(text);
+
+                // Store boxes in normalized format, will convert to pixels when displaying
+                existingLabels.forEach(item => {
+                    if (item.labels && item.labels.length > 0) {
+                        boxes[item.image] = item.labels.map(label => {
+                            const [cx, cy, w, h] = label.coords.split(' ').map(parseFloat);
+                            return {
+                                cx, cy, w, h,  // Store normalized YOLO coords
+                                label: label.label,
+                                isNormalized: true
+                            };
+                        });
+                    }
+                });
+
+                // Filter out already labeled images from pool
+                if (allData.length > 0) {
+                    const labeledImages = new Set(existingLabels.map(item => item.image));
+                    allData = allData.filter(item => !labeledImages.has(item.original_name));
+                    currentIndex = 0;
+                    if (allData.length > 0) {
+                        loadImage();
+                    }
+                }
+
+                showStatus(`Loaded ${existingLabels.length} existing labels. ${allData.length} images remaining.`);
+            } catch (e) {
+                showStatus('Error loading JSON file: ' + e.message, true);
+            }
+        });
+
+        // Load CSV
+        csvFileInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const text = await file.text();
+            const lines = text.split('\n').filter(line => line.trim());
+            const headers = lines[0].split(',');
+
+            const originalNameIdx = headers.indexOf('original_name');
+            const medicineNameIdx = headers.indexOf('medicine_name');
+            const imprintIdx = headers.indexOf('splimprint');
+
+            csvData = lines.slice(1).map(line => {
+                const values = line.split(',');
+                return {
+                    original_name: values[originalNameIdx],
+                    medicine_name: values[medicineNameIdx] || 'Unknown',
+                    splimprint: values[imprintIdx] || '-'
+                };
+            }).filter(item => item.original_name);
+
+            // Filter out already labeled images if JSON was loaded
+            if (existingLabels.length > 0) {
+                const labeledImages = new Set(existingLabels.map(item => item.image));
+                allData = csvData.filter(item => !labeledImages.has(item.original_name));
+                showStatus(`${allData.length} unlabelled images remaining`);
+            } else {
+                allData = csvData;
+            }
+
+            currentIndex = 0;
+            if (allData.length > 0) {
+                loadImage();
+            }
+        });
+
+        // Load image
+        async function loadImage() {
+            if (allData.length === 0) return;
+
+            const item = allData[currentIndex];
+            const img = new Image();
+            const imagePath = `../data/pillbox_production_images_full_202008/${item.original_name}`;
+
+            img.onload = () => {
+                currentImage = img;
+                const maxWidth = 1200;
+                const scale = Math.min(1, maxWidth / img.width);
+                canvas.width = img.width * scale;
+                canvas.height = img.height * scale;
+
+                selectedBoxIdx = null;
+                redraw();
+                updateUI();
+            };
+
+            img.onerror = () => {
+                showStatus(`Error loading image: ${item.original_name}`, true);
+            };
+
+            img.src = imagePath;
+        }
+
+        // Redraw canvas
+        function redraw() {
+            if (!currentImage) return;
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(currentImage, 0, 0, canvas.width, canvas.height);
+
+            const imageKey = allData[currentIndex].original_name;
+            const currentBoxes = boxes[imageKey] || [];
+
+            currentBoxes.forEach((box, idx) => {
+                const isSelected = idx === selectedBoxIdx;
+                const color = isSelected ? '#00aaff' : '#00ff00';
+                drawBox(box, color);
+            });
+
+            if (tempBox) {
+                drawBox(tempBox, '#ffff00');
+            }
+        }
+
+        function drawBox(box, color) {
+            // Convert normalized coords to pixels if needed
+            let x, y, width, height;
+            if (box.isNormalized) {
+                x = (box.cx - box.w/2) * canvas.width;
+                y = (box.cy - box.h/2) * canvas.height;
+                width = box.w * canvas.width;
+                height = box.h * canvas.height;
+            } else {
+                x = box.x;
+                y = box.y;
+                width = box.width;
+                height = box.height;
+            }
+
+            // Draw semi-transparent rectangle
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.globalAlpha = 0.6;
+            ctx.strokeRect(x, y, width, height);
+            ctx.globalAlpha = 1.0;
+
+            // Draw label background and text
+            if (box.label) {
+                ctx.font = '12px monospace';
+                const labelWidth = Math.max(20, ctx.measureText(box.label).width + 6);
+                ctx.fillStyle = color;
+                ctx.globalAlpha = 0.8;
+                ctx.fillRect(x, y - 16, labelWidth, 14);
+                ctx.globalAlpha = 1.0;
+                ctx.fillStyle = '#000';
+                ctx.fillText(box.label, x + 3, y - 5);
+            }
+        }
+
+        // Review mode toggle
+        reviewModeBtn.addEventListener('click', () => {
+            if (existingLabels.length === 0) {
+                showStatus('Please load a JSON file first', true);
+                return;
+            }
+
+            reviewMode = !reviewMode;
+
+            if (reviewMode) {
+                // Switch to review mode: show labeled images
+                const labeledImages = new Set(existingLabels.map(item => item.image));
+                allData = csvData.filter(item => labeledImages.has(item.original_name));
+                reviewModeBtn.textContent = 'Back to Labeling';
+                showStatus(`Review mode: ${allData.length} labeled images`);
+            } else {
+                // Switch back to labeling mode: show unlabeled images
+                const labeledImages = new Set(existingLabels.map(item => item.image));
+                allData = csvData.filter(item => !labeledImages.has(item.original_name));
+                reviewModeBtn.textContent = 'Review Labeled Images';
+                showStatus(`Labeling mode: ${allData.length} unlabeled images`);
+            }
+
+            currentIndex = 0;
+            if (allData.length > 0) {
+                loadImage();
+            } else {
+                showStatus(reviewMode ? 'No labeled images to review' : 'No unlabeled images remaining', true);
+            }
+        });
+
+        // Mouse events
+        canvas.addEventListener('mousedown', (e) => {
+            if (reviewMode) return; // Disable drawing in review mode
+
+            const rect = canvas.getBoundingClientRect();
+            startX = e.clientX - rect.left;
+            startY = e.clientY - rect.top;
+            isDrawing = true;
+            tempBox = { x: startX, y: startY, width: 0, height: 0, label: '' };
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            if (!isDrawing) return;
+
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+
+            tempBox = {
+                x: Math.min(startX, x),
+                y: Math.min(startY, y),
+                width: Math.abs(x - startX),
+                height: Math.abs(y - startY),
+                label: ''
+            };
+
+            redraw();
+        });
+
+        canvas.addEventListener('mouseup', (e) => {
+            if (!isDrawing) return;
+            isDrawing = false;
+
+            if (tempBox && tempBox.width > 5 && tempBox.height > 5) {
+                const imageKey = allData[currentIndex].original_name;
+                if (!boxes[imageKey]) boxes[imageKey] = [];
+
+                boxes[imageKey].push(tempBox);
+                sessionBoxes.add(imageKey); // Mark as labeled in this session
+                selectedBoxIdx = boxes[imageKey].length - 1;
+                updateBoxesList();
+                updateUI();
+                redraw();
+            }
+
+            tempBox = null;
+        });
+
+        // Flag button - mark current image as wrong
+        flagBtn.addEventListener('click', () => {
+            if (!reviewMode) {
+                showStatus('Flag feature only available in Review Mode', true);
+                return;
+            }
+
+            const imageKey = allData[currentIndex].original_name;
+
+            if (flaggedImages.has(imageKey)) {
+                // Unflag
+                flaggedImages.delete(imageKey);
+                flagBtn.textContent = 'Flag as Wrong (F)';
+                flagBtn.style.background = '#ff9800';
+                showStatus(`Unflagged ${imageKey}`);
+            } else {
+                // Flag
+                flaggedImages.add(imageKey);
+                flagBtn.textContent = 'Unflag (F)';
+                flagBtn.style.background = '#f44336';
+                showStatus(`Flagged ${imageKey} as wrong`);
+            }
+
+            updateUI();
+        });
+
+        // Keyboard events for labeling
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                // Delete the last box drawn
+                const imageKey = allData[currentIndex].original_name;
+                if (boxes[imageKey] && boxes[imageKey].length > 0) {
+                    boxes[imageKey].pop();
+                    selectedBoxIdx = null;
+                    updateBoxesList();
+                    updateUI();
+                    redraw();
+                }
+                return;
+            }
+
+            if (e.key === ' ') {
+                // Spacebar: go to next image
+                e.preventDefault();
+                if (currentIndex < allData.length - 1) {
+                    currentIndex++;
+                    loadImage();
+                }
+                return;
+            }
+
+            if (e.key === 'f' || e.key === 'F') {
+                // F key: flag current image (only in review mode)
+                if (reviewMode) {
+                    e.preventDefault();
+                    flagBtn.click();
+                }
+                return;
+            }
+
+            if (selectedBoxIdx === null) return;
+
+            const imageKey = allData[currentIndex].original_name;
+            const box = boxes[imageKey][selectedBoxIdx];
+
+            if (e.key === 'Backspace') {
+                e.preventDefault();
+                box.label = box.label.slice(0, -1);
+                updateBoxesList();
+                redraw();
+            } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+                e.preventDefault();
+                box.label = (box.label || '') + e.key;
+                updateBoxesList();
+                redraw();
+            }
+        });
+
+        // Update boxes list
+        function updateBoxesList() {
+            const imageKey = allData[currentIndex].original_name;
+            const currentBoxes = boxes[imageKey] || [];
+
+            boxesList.innerHTML = currentBoxes.map((box, idx) => `
+                <div class="box-item ${idx === selectedBoxIdx ? 'selected' : ''}" onclick="selectBox(${idx})">
+                    <span>Box ${idx + 1}: "${box.label || ''}"</span>
+                    <div>
+                        <input type="text" class="label-input" value="${box.label || ''}"
+                               onchange="updateBoxLabel(${idx}, this.value)"
+                               onclick="event.stopPropagation()" />
+                        <button class="delete-btn" onclick="event.stopPropagation(); deleteBox(${idx})">Delete</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        window.selectBox = (idx) => {
+            selectedBoxIdx = idx;
+            updateBoxesList();
+            redraw();
+        };
+
+        window.updateBoxLabel = (idx, value) => {
+            const imageKey = allData[currentIndex].original_name;
+            boxes[imageKey][idx].label = value;
+            redraw();
+        };
+
+        window.deleteBox = (idx) => {
+            const imageKey = allData[currentIndex].original_name;
+            boxes[imageKey].splice(idx, 1);
+            if (selectedBoxIdx === idx) selectedBoxIdx = null;
+            else if (selectedBoxIdx > idx) selectedBoxIdx--;
+            updateBoxesList();
+            updateUI();
+            redraw();
+        };
+
+        // Navigation
+        prevBtn.addEventListener('click', () => {
+            if (currentIndex > 0) {
+                currentIndex--;
+                loadImage();
+            }
+        });
+
+        nextBtn.addEventListener('click', () => {
+            if (currentIndex < allData.length - 1) {
+                currentIndex++;
+                loadImage();
+            }
+        });
+
+        // Export to YOLO format (append to existing labels, exclude flagged)
+        exportBtn.addEventListener('click', () => {
+            const newLabels = [];
+
+            Object.keys(boxes).forEach(imageKey => {
+                // Skip flagged images
+                if (flaggedImages.has(imageKey)) return;
+
+                const imageBoxes = boxes[imageKey];
+                if (imageBoxes.length === 0) return;
+
+                const yoloLabels = imageBoxes.map(box => {
+                    let centerX, centerY, normWidth, normHeight;
+
+                    if (box.isNormalized) {
+                        // Already in normalized format, use as-is
+                        centerX = box.cx;
+                        centerY = box.cy;
+                        normWidth = box.w;
+                        normHeight = box.h;
+                    } else {
+                        // Convert pixel coordinates to normalized
+                        centerX = (box.x + box.width / 2) / canvas.width;
+                        centerY = (box.y + box.height / 2) / canvas.height;
+                        normWidth = box.width / canvas.width;
+                        normHeight = box.height / canvas.height;
+                    }
+
+                    return {
+                        label: box.label,
+                        coords: `${centerX.toFixed(6)} ${centerY.toFixed(6)} ${normWidth.toFixed(6)} ${normHeight.toFixed(6)}`
+                    };
+                });
+
+                newLabels.push({
+                    image: imageKey,
+                    labels: yoloLabels
+                });
+            });
+
+            // Combine with existing labels (exclude flagged from existing too)
+            const unflaggedExisting = existingLabels.filter(item => !flaggedImages.has(item.image));
+            const allLabels = [...unflaggedExisting, ...newLabels];
+
+            const blob = new Blob([JSON.stringify(allLabels, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'imprint_labels.json';
+            a.click();
+
+            const flaggedCount = flaggedImages.size;
+            showStatus(`Exported ${allLabels.length} images (${newLabels.length} new, ${flaggedCount} flagged excluded)`);
+        });
+
+        function updateUI() {
+            const mode = reviewMode ? 'labeled' : 'unlabeled';
+            const currentImageKey = allData[currentIndex]?.original_name;
+            const isFlagged = currentImageKey && flaggedImages.has(currentImageKey);
+
+            imageCounter.textContent = `${currentIndex + 1} / ${allData.length} ${mode}`;
+            imageName.textContent = currentImageKey || '-';
+            medicineName.textContent = allData[currentIndex]?.medicine_name || '-';
+            imprintText.textContent = allData[currentIndex]?.splimprint || '-';
+
+            const sessionCount = sessionBoxes.size;
+            const totalLabelled = existingLabels.length + sessionCount;
+            const flaggedCount = flaggedImages.size;
+
+            progressText.textContent = reviewMode
+                ? `Review mode - ${flaggedCount} flagged as wrong`
+                : `${sessionCount} labeled this session, ${totalLabelled} total`;
+
+            // Update flag button state
+            if (reviewMode && currentImageKey) {
+                flagBtn.disabled = false;
+                if (isFlagged) {
+                    flagBtn.textContent = 'Unflag (F)';
+                    flagBtn.style.background = '#f44336';
+                    canvas.style.border = '4px solid #f44336'; // Red border for flagged
+                } else {
+                    flagBtn.textContent = 'Flag as Wrong (F)';
+                    flagBtn.style.background = '#ff9800';
+                    canvas.style.border = '2px solid #333'; // Normal border
+                }
+            } else {
+                flagBtn.disabled = true;
+                canvas.style.border = '2px solid #333';
+            }
+
+            prevBtn.disabled = currentIndex === 0;
+            nextBtn.disabled = currentIndex === allData.length - 1;
+
+            updateBoxesList();
+        }
+
+        function showStatus(message, isError = false) {
+            status.textContent = message;
+            status.style.display = 'block';
+            status.style.background = isError ? '#ffebee' : '#e8f5e9';
+            setTimeout(() => status.style.display = 'none', 3000);
+        }
+    </script>
+</body>
+</html>
