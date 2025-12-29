@@ -1,3 +1,13 @@
 data/
+models/
+archive/
+
 results_log.txt
 RNN_ARCHITECTURE.md
+validation_preview.jpg
+
+__pycache__/
+venv/
+.venv
+
+.claude

@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pill Imprint Vetter</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5; }
+        .container { max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }
+        h1 { margin-bottom: 20px; }
+        .controls { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; align-items: center; }
+        button { padding: 8px 16px; cursor: pointer; border: 1px solid #ccc; background: #fff; border-radius: 4px; }
+        button:hover { background: #f0f0f0; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        input[type="file"] { padding: 8px; }
+        .canvas-container { position: relative; display: inline-block; margin-bottom: 20px; overflow: auto; max-width: 100%; max-height: 800px; border: 2px solid #333; }
+        canvas { display: block; cursor: crosshair; }
+        .zoom-indicator { position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.7); color: white; padding: 5px 10px; border-radius: 4px; font-size: 12px; pointer-events: none; }
+        .info { margin-bottom: 10px; padding: 10px; background: #f9f9f9; border-radius: 4px; }
+        .boxes-list { margin-top: 20px; }
+        .box-item { padding: 8px; margin: 5px 0; background: #f0f0f0; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; }
+        .box-item.selected { background: #d0e8ff; }
+        .label-input { padding: 4px 8px; width: 120px; font-family: monospace; }
+        .delete-btn { padding: 4px 12px; background: #ff4444; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .delete-btn:hover { background: #cc0000; }
+        .status { padding: 10px; margin-top: 10px; background: #e8f5e9; border-radius: 4px; }
+        label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Pill Imprint Vetter</h1>
+
+        <div class="controls">
+            <label>CSV: <input type="file" id="csvFile" accept=".csv" /></label>
+            <label>JSON Labels: <input type="file" id="jsonFile" accept=".json" /></label>
+            <button id="prevBtn">Previous</button>
+            <button id="nextBtn">Next</button>
+            <button id="exportBtn">Export Updated Labels</button>
+            <span id="imageCounter">0 / 0</span>
+            <label>Go to: <input type="number" id="jumpToInput" min="1" style="width: 80px;" placeholder="#" /></label>
+        </div>
+
+        <div class="info">
+            <div><strong>Image:</strong> <span id="imageName">-</span></div>
+            <div><strong>Expected Imprint:</strong> <span id="imprintText">-</span></div>
+            <div><strong>Boxes:</strong> <span id="boxCount">0</span></div>
+            <div><strong>Instructions:</strong> Load CSV + JSON → Review boxes → Click box to select/edit label → Double-click box to delete → Draw new box if needed → ESC to delete last box → Space to go to next image → Scroll to zoom → Right-click + drag to pan</div>
+        </div>
+
+        <div class="canvas-container">
+            <canvas id="canvas"></canvas>
+            <div id="zoomIndicator" class="zoom-indicator">100%</div>
+        </div>
+
+        <div class="boxes-list">
+            <h3>Imprint Labels:</h3>
+            <div id="boxesList"></div>
+        </div>
+
+        <div id="status" class="status" style="display: none;"></div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const csvFileInput = document.getElementById('csvFile');
+        const jsonFileInput = document.getElementById('jsonFile');
+        const prevBtn = document.getElementById('prevBtn');
+        const nextBtn = document.getElementById('nextBtn');
+        const exportBtn = document.getElementById('exportBtn');
+        const imageCounter = document.getElementById('imageCounter');
+        const imageName = document.getElementById('imageName');
+        const imprintText = document.getElementById('imprintText');
+        const boxCount = document.getElementById('boxCount');
+        const boxesList = document.getElementById('boxesList');
+        const status = document.getElementById('status');
+        const zoomIndicator = document.getElementById('zoomIndicator');
+        const jumpToInput = document.getElementById('jumpToInput');
+
+        let allData = []; // Array of { image: string, labels: [...] }
+        let currentIndex = 0;
+        let currentImage = null;
+        let imageMetadata = {}; // Store original width/height for each image
+        let boxes = {}; // Stores boxes per image (normalized YOLO format)
+        let selectedBoxIdx = null;
+        let modifiedImages = new Set(); // Track images modified in this session
+        let csvData = {}; // Map of image name to CSV row data (including splimprint_clean)
+
+        // Zoom and pan states
+        let zoomLevel = 1.0;
+        let panX = 0;
+        let panY = 0;
+        let isPanning = false;
+        let panStartX = 0;
+        let panStartY = 0;
+        let baseCanvasWidth = 0;
+        let baseCanvasHeight = 0;
+
+        // Interaction states
+        let isDrawing = false;
+        let startX, startY;
+        let tempBox = null;
+        let lastClickTime = 0;
+        let lastClickBoxIdx = null;
+        let isEditingLabel = false; // Track if we're editing or replacing
+
+        // Load CSV file
+        csvFileInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            try {
+                const text = await file.text();
+                const lines = text.split('\n').filter(line => line.trim());
+                const headers = lines[0].split(',');
+
+                const originalNameIdx = headers.indexOf('original_name');
+                const imprintIdx = headers.indexOf('splimprint_clean');
+
+                csvData = {};
+                lines.slice(1).forEach(line => {
+                    const values = line.split(',');
+                    const imageName = values[originalNameIdx];
+                    if (imageName) {
+                        csvData[imageName] = {
+                            splimprint_clean: values[imprintIdx] || '-'
+                        };
+                    }
+                });
+
+                showStatus(`Loaded CSV with ${Object.keys(csvData).length} entries`);
+
+                // Refresh UI if image is already loaded
+                if (currentImage) {
+                    updateUI();
+                }
+            } catch (e) {
+                showStatus('Error loading CSV file: ' + e.message, true);
+            }
+        });
+
+        // Load JSON labels
+        jsonFileInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            try {
+                const text = await file.text();
+                allData = JSON.parse(text);
+
+                // Convert array format to boxes object
+                boxes = {};
+                allData.forEach(item => {
+                    const imageKey = item.image;
+                    boxes[imageKey] = item.labels && item.labels.length > 0
+                        ? item.labels.map(label => {
+                            const [cx, cy, w, h] = label.coords.split(' ').map(parseFloat);
+                            return {
+                                cx, cy, w, h,
+                                label: label.label
+                            };
+                        })
+                        : [];
+                });
+
+                currentIndex = 0;
+                if (allData.length > 0) {
+                    loadImage();
+                }
+
+                showStatus(`Loaded ${allData.length} images with labels`);
+            } catch (e) {
+                showStatus('Error loading JSON file: ' + e.message, true);
+            }
+        });
+
+        // Load image
+        async function loadImage() {
+            if (allData.length === 0) return;
+
+            const item = allData[currentIndex];
+            const imageKey = item.image;
+            const img = new Image();
+            const imagePath = `../data/pillbox_production_images_full_202008/${imageKey}`;
+
+            img.onload = () => {
+                currentImage = img;
+
+                // Store original image dimensions
+                imageMetadata[imageKey] = {
+                    width: img.width,
+                    height: img.height
+                };
+
+                // Scale canvas for display
+                const maxWidth = 1200;
+                const scale = Math.min(1, maxWidth / img.width);
+                baseCanvasWidth = img.width * scale;
+                baseCanvasHeight = img.height * scale;
+                canvas.width = baseCanvasWidth;
+                canvas.height = baseCanvasHeight;
+
+                // Reset zoom and pan
+                zoomLevel = 1.0;
+                panX = 0;
+                panY = 0;
+
+                selectedBoxIdx = null;
+                redraw();
+                updateUI();
+            };
+
+            img.onerror = () => {
+                showStatus(`Error loading image: ${imageKey}. Skipping to next image.`, true);
+
+                // Skip to next image on error
+                if (currentIndex < allData.length - 1) {
+                    currentIndex++;
+                    loadImage();
+                } else if (currentIndex > 0) {
+                    // If we're at the end, try going back
+                    currentIndex--;
+                    loadImage();
+                } else {
+                    // Only one image and it failed
+                    showStatus(`Cannot load image: ${imageKey}. Please check the file path.`, true);
+                    currentImage = null;
+                    updateUI();
+                }
+            };
+
+            img.src = imagePath;
+        }
+
+        // Redraw canvas
+        function redraw() {
+            if (!currentImage) return;
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Apply zoom and pan transformations
+            ctx.save();
+            ctx.translate(panX, panY);
+            ctx.scale(zoomLevel, zoomLevel);
+
+            ctx.drawImage(currentImage, 0, 0, baseCanvasWidth, baseCanvasHeight);
+
+            const imageKey = allData[currentIndex].image;
+            const currentBoxes = boxes[imageKey] || [];
+
+            currentBoxes.forEach((box, idx) => {
+                const isSelected = idx === selectedBoxIdx;
+                const color = isSelected ? '#00aaff' : '#00ff00';
+                drawBox(box, color);
+            });
+
+            if (tempBox) {
+                drawBox(tempBox, '#ffff00');
+            }
+
+            ctx.restore();
+        }
+
+        function drawBox(box, color) {
+            // Convert normalized coords to base canvas pixels (before zoom)
+            let x, y, width, height;
+
+            if (box.cx !== undefined) {
+                // Normalized format
+                x = (box.cx - box.w/2) * baseCanvasWidth;
+                y = (box.cy - box.h/2) * baseCanvasHeight;
+                width = box.w * baseCanvasWidth;
+                height = box.h * baseCanvasHeight;
+            } else {
+                // Pixel format (temporary during drawing)
+                x = box.x;
+                y = box.y;
+                width = box.width;
+                height = box.height;
+            }
+
+            // Draw semi-transparent rectangle
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2 / zoomLevel;
+            ctx.globalAlpha = 0.6;
+            ctx.strokeRect(x, y, width, height);
+            ctx.globalAlpha = 1.0;
+
+            // Draw label background and text
+            if (box.label) {
+                const fontSize = 12 / zoomLevel;
+                ctx.font = `${fontSize}px monospace`;
+                const labelWidth = Math.max(20, ctx.measureText(box.label).width + 6);
+                ctx.fillStyle = color;
+                ctx.globalAlpha = 0.8;
+                ctx.fillRect(x, y - 16 / zoomLevel, labelWidth, 14 / zoomLevel);
+                ctx.globalAlpha = 1.0;
+                ctx.fillStyle = '#000';
+                ctx.fillText(box.label, x + 3 / zoomLevel, y - 5 / zoomLevel);
+            }
+        }
+
+        // Helper function to convert screen coordinates to canvas coordinates
+        function screenToCanvas(screenX, screenY) {
+            const rect = canvas.getBoundingClientRect();
+            const x = (screenX - rect.left - panX) / zoomLevel;
+            const y = (screenY - rect.top - panY) / zoomLevel;
+            return { x, y };
+        }
+
+        // Check if a point is inside a box or its label
+        function getBoxAtPoint(x, y) {
+            const imageKey = allData[currentIndex].image;
+            const currentBoxes = boxes[imageKey] || [];
+
+            for (let i = currentBoxes.length - 1; i >= 0; i--) {
+                const box = currentBoxes[i];
+                const boxX = (box.cx - box.w/2) * baseCanvasWidth;
+                const boxY = (box.cy - box.h/2) * baseCanvasHeight;
+                const boxWidth = box.w * baseCanvasWidth;
+                const boxHeight = box.h * baseCanvasHeight;
+
+                // Check if point is inside the bounding box
+                if (x >= boxX && x <= boxX + boxWidth && y >= boxY && y <= boxY + boxHeight) {
+                    return i;
+                }
+
+                // Check if point is inside the label area (if label exists)
+                if (box.label) {
+                    const fontSize = 12 / zoomLevel;
+                    ctx.font = `${fontSize}px monospace`;
+                    const labelWidth = Math.max(20, ctx.measureText(box.label).width + 6);
+                    const labelHeight = 14 / zoomLevel;
+                    const labelX = boxX;
+                    const labelY = boxY - 16 / zoomLevel;
+
+                    if (x >= labelX && x <= labelX + labelWidth &&
+                        y >= labelY && y <= labelY + labelHeight) {
+                        return i;
+                    }
+                }
+            }
+            return null;
+        }
+
+        // Mouse wheel zoom
+        canvas.addEventListener('wheel', (e) => {
+            e.preventDefault();
+
+            const rect = canvas.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
+
+            // Calculate zoom
+            const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+            const newZoom = Math.max(0.5, Math.min(5, zoomLevel * zoomFactor));
+
+            // Adjust pan to zoom towards mouse position
+            panX = mouseX - (mouseX - panX) * (newZoom / zoomLevel);
+            panY = mouseY - (mouseY - panY) * (newZoom / zoomLevel);
+
+            zoomLevel = newZoom;
+
+            // Update canvas size to accommodate zoom
+            canvas.width = baseCanvasWidth * zoomLevel;
+            canvas.height = baseCanvasHeight * zoomLevel;
+
+            // Update zoom indicator
+            zoomIndicator.textContent = `${Math.round(zoomLevel * 100)}%`;
+
+            redraw();
+        }, { passive: false });
+
+        // Mouse events
+        canvas.addEventListener('mousedown', (e) => {
+            const rect = canvas.getBoundingClientRect();
+
+            // Right click or Ctrl+Click for panning
+            if (e.button === 2 || e.ctrlKey) {
+                isPanning = true;
+                panStartX = e.clientX - panX;
+                panStartY = e.clientY - panY;
+                canvas.style.cursor = 'grab';
+                e.preventDefault();
+                return;
+            }
+
+            // Left click
+            const coords = screenToCanvas(e.clientX, e.clientY);
+
+            // Check if clicking on existing box
+            const boxIdx = getBoxAtPoint(coords.x, coords.y);
+
+            if (boxIdx !== null) {
+                // Check for double-click
+                const currentTime = new Date().getTime();
+                if (boxIdx === lastClickBoxIdx && currentTime - lastClickTime < 300) {
+                    // Double-click: delete box
+                    deleteBox(boxIdx);
+                    lastClickTime = 0;
+                    lastClickBoxIdx = null;
+                    return;
+                }
+
+                // Single click: select box
+                selectedBoxIdx = boxIdx;
+                isEditingLabel = false; // Reset to replace mode when selecting a box
+                updateBoxesList();
+                redraw();
+
+                lastClickTime = currentTime;
+                lastClickBoxIdx = boxIdx;
+                return;
+            }
+
+            // Start drawing new box
+            lastClickTime = 0;
+            lastClickBoxIdx = null;
+            startX = coords.x;
+            startY = coords.y;
+            isDrawing = true;
+            tempBox = { x: startX, y: startY, width: 0, height: 0, label: '' };
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            if (isPanning) {
+                panX = e.clientX - panStartX;
+                panY = e.clientY - panStartY;
+                redraw();
+                return;
+            }
+
+            if (!isDrawing) return;
+
+            const coords = screenToCanvas(e.clientX, e.clientY);
+            const x = coords.x;
+            const y = coords.y;
+
+            tempBox = {
+                x: Math.min(startX, x),
+                y: Math.min(startY, y),
+                width: Math.abs(x - startX),
+                height: Math.abs(y - startY),
+                label: ''
+            };
+
+            redraw();
+        });
+
+        canvas.addEventListener('mouseup', (e) => {
+            if (isPanning) {
+                isPanning = false;
+                canvas.style.cursor = 'crosshair';
+                return;
+            }
+
+            if (!isDrawing) return;
+            isDrawing = false;
+
+            if (tempBox && tempBox.width > 5 && tempBox.height > 5) {
+                const imageKey = allData[currentIndex].image;
+                if (!boxes[imageKey]) boxes[imageKey] = [];
+
+                // Convert pixel coords to normalized format
+                const originalWidth = imageMetadata[imageKey].width;
+                const originalHeight = imageMetadata[imageKey].height;
+                const scaleX = originalWidth / baseCanvasWidth;
+                const scaleY = originalHeight / baseCanvasHeight;
+
+                const normalizedBox = {
+                    cx: ((tempBox.x + tempBox.width / 2) * scaleX) / originalWidth,
+                    cy: ((tempBox.y + tempBox.height / 2) * scaleY) / originalHeight,
+                    w: (tempBox.width * scaleX) / originalWidth,
+                    h: (tempBox.height * scaleY) / originalHeight,
+                    label: ''
+                };
+
+                boxes[imageKey].push(normalizedBox);
+                modifiedImages.add(imageKey);
+                selectedBoxIdx = boxes[imageKey].length - 1;
+                updateBoxesList();
+                updateUI();
+                redraw();
+            }
+
+            tempBox = null;
+        });
+
+        // Disable right-click context menu
+        canvas.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+        });
+
+        // Keyboard events
+        document.addEventListener('keydown', (e) => {
+            // Don't process keyboard shortcuts if typing in the jump input
+            if (document.activeElement === jumpToInput) return;
+
+            if (e.key === 'Escape') {
+                // Delete the last box drawn
+                const imageKey = allData[currentIndex].image;
+                if (boxes[imageKey] && boxes[imageKey].length > 0) {
+                    boxes[imageKey].pop();
+                    modifiedImages.add(imageKey);
+                    selectedBoxIdx = null;
+                    isEditingLabel = false;
+                    updateBoxesList();
+                    updateUI();
+                    redraw();
+                }
+                return;
+            }
+
+            if (e.key === ' ') {
+                // Spacebar: go to next image
+                e.preventDefault();
+                if (currentIndex < allData.length - 1) {
+                    currentIndex++;
+                    loadImage();
+                }
+                return;
+            }
+
+            if (selectedBoxIdx === null) return;
+
+            const imageKey = allData[currentIndex].image;
+            const box = boxes[imageKey][selectedBoxIdx];
+
+            if (e.key === 'Backspace') {
+                e.preventDefault();
+                box.label = box.label.slice(0, -1);
+                isEditingLabel = true; // Now in edit mode
+                modifiedImages.add(imageKey);
+                updateBoxesList();
+                redraw();
+            } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+                e.preventDefault();
+                if (!isEditingLabel) {
+                    // Replace mode: clear the label and start fresh
+                    box.label = e.key;
+                    isEditingLabel = true; // Switch to edit mode after first character
+                } else {
+                    // Edit mode: append to existing label
+                    box.label = (box.label || '') + e.key;
+                }
+                modifiedImages.add(imageKey);
+                updateBoxesList();
+                redraw();
+            }
+        });
+
+        // Update boxes list
+        function updateBoxesList() {
+            const imageKey = allData[currentIndex].image;
+            const currentBoxes = boxes[imageKey] || [];
+
+            boxesList.innerHTML = currentBoxes.map((box, idx) => `
+                <div class="box-item ${idx === selectedBoxIdx ? 'selected' : ''}" onclick="selectBox(${idx})">
+                    <span>Box ${idx + 1}: "${box.label || ''}"</span>
+                    <div>
+                        <input type="text" class="label-input" value="${box.label || ''}"
+                               onchange="updateBoxLabel(${idx}, this.value)"
+                               onclick="event.stopPropagation()" />
+                        <button class="delete-btn" onclick="event.stopPropagation(); deleteBox(${idx})">Delete</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        window.selectBox = (idx) => {
+            selectedBoxIdx = idx;
+            isEditingLabel = false; // Reset to replace mode when selecting from list
+            updateBoxesList();
+            redraw();
+        };
+
+        window.updateBoxLabel = (idx, value) => {
+            const imageKey = allData[currentIndex].image;
+            boxes[imageKey][idx].label = value;
+            modifiedImages.add(imageKey);
+            redraw();
+        };
+
+        window.deleteBox = (idx) => {
+            const imageKey = allData[currentIndex].image;
+            boxes[imageKey].splice(idx, 1);
+            modifiedImages.add(imageKey);
+            if (selectedBoxIdx === idx) selectedBoxIdx = null;
+            else if (selectedBoxIdx > idx) selectedBoxIdx--;
+            updateBoxesList();
+            updateUI();
+            redraw();
+        };
+
+        // Navigation
+        prevBtn.addEventListener('click', () => {
+            if (currentIndex > 0) {
+                currentIndex--;
+                loadImage();
+            }
+        });
+
+        nextBtn.addEventListener('click', () => {
+            if (currentIndex < allData.length - 1) {
+                currentIndex++;
+                loadImage();
+            }
+        });
+
+        // Jump to specific image number
+        jumpToInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                const targetNum = parseInt(jumpToInput.value);
+                if (!isNaN(targetNum) && targetNum >= 1 && targetNum <= allData.length) {
+                    currentIndex = targetNum - 1; // Convert 1-based to 0-based index
+                    loadImage();
+                    jumpToInput.value = ''; // Clear the input
+                    jumpToInput.blur(); // Remove focus
+                } else {
+                    showStatus(`Please enter a number between 1 and ${allData.length}`, true);
+                }
+            }
+        });
+
+        // Export updated JSON
+        exportBtn.addEventListener('click', () => {
+            const updatedData = allData.map(item => {
+                const imageKey = item.image;
+                const imageBoxes = boxes[imageKey] || [];
+
+                const yoloLabels = imageBoxes.map(box => ({
+                    label: box.label || '',
+                    coords: `${box.cx.toFixed(6)} ${box.cy.toFixed(6)} ${box.w.toFixed(6)} ${box.h.toFixed(6)}`
+                }));
+
+                return {
+                    image: imageKey,
+                    labels: yoloLabels
+                };
+            });
+
+            const blob = new Blob([JSON.stringify(updatedData, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'imprint_labels_updated.json';
+            a.click();
+
+            showStatus(`Exported ${updatedData.length} images (${modifiedImages.size} modified this session)`);
+        });
+
+        function updateUI() {
+            if (allData.length === 0) {
+                imageCounter.textContent = '0 / 0';
+                imageName.textContent = '-';
+                imprintText.textContent = '-';
+                boxCount.textContent = '0';
+                prevBtn.disabled = true;
+                nextBtn.disabled = true;
+                return;
+            }
+
+            const currentImageKey = allData[currentIndex]?.image;
+            const currentBoxes = boxes[currentImageKey] || [];
+
+            imageCounter.textContent = `${currentIndex + 1} / ${allData.length}`;
+            imageName.textContent = currentImageKey || '-';
+
+            // Display splimprint_clean from CSV data if available
+            const csvInfo = csvData[currentImageKey];
+            imprintText.textContent = csvInfo?.splimprint_clean || '-';
+
+            boxCount.textContent = currentBoxes.length;
+
+            prevBtn.disabled = currentIndex === 0;
+            nextBtn.disabled = currentIndex === allData.length - 1;
+
+            updateBoxesList();
+        }
+
+        function showStatus(message, isError = false) {
+            status.textContent = message;
+            status.style.display = 'block';
+            status.style.background = isError ? '#ffebee' : '#e8f5e9';
+            setTimeout(() => status.style.display = 'none', 3000);
+        }
+    </script>
+</body>
+</html>
